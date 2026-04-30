@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger("inveniq")
 
 # ── Groq client (async, with timeout) ─────────────────────────────────────────
-GROQ_API_KEY = "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"
+GROQ_API_KEY = "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"
 client = AsyncGroq(
     api_key=GROQ_API_KEY,
     timeout=60.0,  # don't let a hung upstream hold a worker forever
