@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/chat", "destination": "api/glm_backend_groq.py" },
+    { "source": "/search-signal", "destination": "api/glm_backend_groq.py" },
+    { "source": "/(.*)", "destination": "/inventory_chat_api_groq.html" }
+  ]
+}
