@@ -4,6 +4,7 @@ import logging
 import urllib.request
 import urllib.parse
 import json
+import concurrent.futures
 from datetime import datetime
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -22,10 +23,10 @@ logger = logging.getLogger("inveniq")
 GROQ_API_KEY = "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"
 client = AsyncGroq(
     api_key=GROQ_API_KEY,
-    timeout=60.0,  # don't let a hung upstream hold a worker forever
+    timeout=45.0,  # don't let a hung upstream hold a worker forever
 )
 
-app = FastAPI(title="InvenIQ Backend", version="4.0.0")
+app = FastAPI(title="InvenIQ Backend", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,22 +71,49 @@ WEB_SEARCH_TOOL = {
 }
 
 
-# ── DuckDuckGo helper (single source of truth) ────────────────────────────────
-def _ddgs_search(query: str, max_results: int = 5, max_retries: int = 3) -> tuple[list, str | None]:
+# ── DuckDuckGo helper with hard wall-clock timeout ────────────────────────────
+# DDGS().text() can occasionally hang on a slow upstream; we wrap it in a
+# thread + future.result(timeout=...) so the request can NEVER stall a worker
+# longer than the budget below.
+_DDGS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _ddgs_call_once(query: str, max_results: int) -> list:
+    """Single blocking DDGS call. Run inside a thread via the executor."""
+    with DDGS() as ddgs:
+        return list(ddgs.text(query, max_results=max_results))
+
+
+def _ddgs_search(
+    query: str,
+    max_results: int = 5,
+    max_retries: int = 1,
+    per_call_timeout: float = 8.0,
+) -> tuple[list, str | None]:
     """
-    Run a DuckDuckGo text search with retry + rate-limit handling.
+    DuckDuckGo text search with retry + rate-limit handling + hard timeout.
     Returns (results, error). On success, error is None.
+
+    `max_retries=1` means a single attempt (no retries). Bump it for the
+    /search-signal endpoint where the user is explicitly waiting.
     """
     last_err: str | None = None
     for attempt in range(max_retries):
+        future = _DDGS_EXECUTOR.submit(_ddgs_call_once, query, max_results)
         try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
+            results = future.result(timeout=per_call_timeout)
             if results:
                 return results, None
-            # empty results – brief pause, try again
+            # empty results — short pause then maybe retry
+            last_err = "empty"
             if attempt < max_retries - 1:
                 time.sleep(1.5 * (attempt + 1))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            last_err = "timeout"
+            logger.warning("DDGS timeout after %.1fs for query: %s", per_call_timeout, query)
+            if attempt < max_retries - 1:
+                time.sleep(1.0)
         except Exception as e:
             err_msg = str(e).lower()
             is_rate_limit = any(
@@ -93,30 +121,41 @@ def _ddgs_search(query: str, max_results: int = 5, max_retries: int = 3) -> tupl
             )
             last_err = "rate_limit" if is_rate_limit else f"error: {e}"
             if attempt < max_retries - 1:
-                wait = (4 if is_rate_limit else 2) * (attempt + 1)
-                logger.warning("DDGS %s – waiting %ss before retry %d", last_err, wait, attempt + 1)
+                wait = (3 if is_rate_limit else 1.5) * (attempt + 1)
+                logger.warning("DDGS %s — waiting %ss before retry %d", last_err, wait, attempt + 1)
                 time.sleep(wait)
     return [], last_err
 
 
 def perform_web_search(query: str) -> str:
-    """Web search used by the AI's tool-use loop. Returns formatted markdown string."""
-    results, err = _ddgs_search(query, max_results=5)
+    """
+    Web search used by the AI's tool-use loop. Kept FAST and FAILS FAST so the
+    chat endpoint can never get stuck. Returns a formatted markdown string the
+    LLM can read (or a clear error message it can summarize).
+    """
+    # Single attempt only inside the chat loop — the loop itself can retry
+    # with a different query if it wants to.
+    results, err = _ddgs_search(query, max_results=5, max_retries=1, per_call_timeout=8.0)
     if results:
         return "\n\n".join(
             f"- **{r['title']}**\n  {r['body']}\n  Source: {r['href']}"
             for r in results
         )
     if err == "rate_limit":
-        return "Search rate limited — please wait a moment and try again."
-    if err:
-        return f"Search error: {err}"
-    return "No results found for this query."
+        return ("Web search is rate-limited right now. Answer the user's question "
+                "using your existing knowledge and clearly note that live data was "
+                "unavailable.")
+    if err == "timeout":
+        return ("Web search timed out. Answer the user's question using your "
+                "existing knowledge and clearly note that live data was unavailable.")
+    if err and err != "empty":
+        return (f"Web search failed ({err}). Answer using existing knowledge and "
+                "note that live data was unavailable.")
+    return ("No web results found for this query. Answer using existing knowledge "
+            "and note that live data was unavailable.")
 
 
 # ── System prompt (the AI's personality) ──────────────────────────────────────
-# 🧠 THIS IS YOUR AI'S BRAIN/PERSONALITY!
-# Edit this text to make the AI behave exactly how you want.
 MASTER_PROMPT = """You are InvenIQ, an elite, professional Inventory Intelligence AI.
 Your primary job is to help the user manage their stock, analyze sales data, and predict inventory shortages.
 
@@ -124,7 +163,8 @@ RULES:
 1. Be highly analytical, precise, and professional.
 2. Format your answers clearly using bullet points or short paragraphs.
 3. When the user asks about current news, events, market trends, weather, calendar info, or any real-time unstructured data, use the web_search tool to fetch up-to-date information before answering.
-4. If you need more data (like a CSV file or numbers) to answer a question, ask the user to provide it.
+4. If web_search returns an error or rate-limit message, DO NOT call it again. Answer using your existing knowledge and clearly tell the user that live data was unavailable.
+5. If you need more data (like a CSV file or numbers) to answer a question, ask the user to provide it.
 """
 
 # ── Signal query templates (year is filled in dynamically) ────────────────────
@@ -172,7 +212,6 @@ def fetch_weather_wttr(location: str = "Malaysia") -> str:
                 date = day.get("date", "")
                 max_t = day.get("maxtempC", "")
                 min_t = day.get("mintempC", "")
-                # wttr returns 8 three-hour blocks; index 4 ≈ midday (12:00)
                 hourly = day.get("hourly", [])
                 desc = (
                     hourly[4].get("weatherDesc", [{}])[0].get("value", "")
@@ -193,14 +232,44 @@ def fetch_weather_wttr(location: str = "Malaysia") -> str:
     return "\n\n".join(parts)
 
 
+# ── Tiny in-memory cache for /search-signal (5 min TTL) ───────────────────────
+# Massively reduces DDGS hits when the user clicks the panel buttons repeatedly,
+# which is the #1 cause of rate-limiting in this app.
+_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
+_SIGNAL_CACHE_TTL = 300.0  # seconds
+
+
+def _cache_get(key: str) -> dict | None:
+    entry = _SIGNAL_CACHE.get(key)
+    if not entry:
+        return None
+    ts, payload = entry
+    if time.time() - ts > _SIGNAL_CACHE_TTL:
+        _SIGNAL_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _cache_set(key: str, payload: dict) -> None:
+    _SIGNAL_CACHE[key] = (time.time(), payload)
+
+
 # ── Signal search endpoint ────────────────────────────────────────────────────
 @app.post("/search-signal")
 def search_signal(req: SignalSearchRequest):
+    cache_key = f"{req.category}|{req.location}|{req.context}"
+    cached = _cache_get(cache_key)
+    if cached:
+        logger.info("Signal cache HIT for %s", cache_key)
+        return cached
+
     # ── Weather: use wttr.in directly ──
     if req.category == "weather":
         try:
             weather = fetch_weather_wttr(req.location)
-            return {"results": weather, "query": "wttr.in API"}
+            payload = {"results": weather, "query": "wttr.in API"}
+            _cache_set(cache_key, payload)
+            return payload
         except Exception as e:
             logger.exception("Weather endpoint failed")
             return {"results": f"Weather fetch failed: {e}", "query": "wttr.in API"}
@@ -209,18 +278,26 @@ def search_signal(req: SignalSearchRequest):
     queries_map = _signal_queries(datetime.now().year)
     templates = queries_map.get(req.category, queries_map["raw"])
 
-    # Build ctx fragment with clean spacing
     ctx_part = f" {req.context} " if req.context else " "
 
     rendered_queries: list[str] = []
     all_results: list[str] = []
+    any_rate_limited = False
 
     for template in templates:
-        # Render the template, then collapse any double-spacing
         query = " ".join(template.format(location=req.location, ctx=ctx_part).split())
         rendered_queries.append(query)
 
-        results, _ = _ddgs_search(query, max_results=6, max_retries=2)
+        # Inside /search-signal we allow 2 retries because the user is
+        # explicitly waiting and clicked a button.
+        results, err = _ddgs_search(
+            query,
+            max_results=6,
+            max_retries=2,
+            per_call_timeout=8.0,
+        )
+        if err == "rate_limit":
+            any_rate_limited = True
         for r in results:
             all_results.append(f"• {r['title']}: {r['body']}")
 
@@ -237,11 +314,15 @@ def search_signal(req: SignalSearchRequest):
 
     primary_query = rendered_queries[0] if rendered_queries else ""
     if not unique:
-        return {
-            "results": "Search temporarily unavailable — try again in a moment.",
-            "query": primary_query,
-        }
-    return {"results": "\n".join(unique), "query": primary_query}
+        msg = ("Search rate-limited by DuckDuckGo — try again in ~30 seconds."
+               if any_rate_limited
+               else "Search temporarily unavailable — try again in a moment.")
+        # Don't cache failures — we want the next click to retry.
+        return {"results": msg, "query": primary_query}
+
+    payload = {"results": "\n".join(unique), "query": primary_query}
+    _cache_set(cache_key, payload)
+    return payload
 
 
 # ── Chat endpoint (async + tool-use loop, OpenAI/Groq schema) ─────────────────
@@ -249,7 +330,6 @@ def search_signal(req: SignalSearchRequest):
 async def chat(req: ChatRequest):
     try:
         # Compose system prompt: master + any system messages from history.
-        # In OpenAI/Groq schema the system message goes inside the messages array.
         system_msg = MASTER_PROMPT
         chat_messages: list[dict] = []
         for msg in req.messages:
@@ -258,7 +338,6 @@ async def chat(req: ChatRequest):
             else:
                 chat_messages.append(msg)
 
-        # Prepend the consolidated system message
         full_messages = [{"role": "system", "content": system_msg}] + chat_messages
 
         common_kwargs = {
@@ -272,15 +351,14 @@ async def chat(req: ChatRequest):
         # First call
         response = await client.chat.completions.create(messages=full_messages, **common_kwargs)
 
-        # Tool-use loop
-        max_iterations = 5
+        # Tool-use loop — capped tighter to keep total latency bounded
+        max_iterations = 2
         for iteration in range(max_iterations):
             assistant_msg = response.choices[0].message
             tool_calls = assistant_msg.tool_calls or []
             if not tool_calls:
                 break
 
-            # Append the assistant's tool-call turn (must include tool_calls field)
             full_messages.append({
                 "role": "assistant",
                 "content": assistant_msg.content or "",
@@ -297,7 +375,6 @@ async def chat(req: ChatRequest):
                 ],
             })
 
-            # Execute each tool call and append individual tool-result messages
             unknown_tool_seen = False
             for tc in tool_calls:
                 if tc.function.name == "web_search":
@@ -306,6 +383,7 @@ async def chat(req: ChatRequest):
                     except json.JSONDecodeError:
                         args = {}
                     query = args.get("query", "")
+                    logger.info("Tool web_search query: %s", query)
                     search_result = perform_web_search(query)
                 else:
                     logger.warning("Unknown tool requested: %s", tc.function.name)
@@ -318,16 +396,21 @@ async def chat(req: ChatRequest):
                     "content": search_result,
                 })
 
-            # Send tool results back so the model can produce its final answer
             response = await client.chat.completions.create(messages=full_messages, **common_kwargs)
 
-            # If the model hallucinated a tool, give it one recovery turn then stop
             if unknown_tool_seen:
                 break
         else:
             logger.warning("Tool-use loop hit max_iterations=%d", max_iterations)
 
         final_text = response.choices[0].message.content or ""
+
+        # Safety net: if after the loop the model is STILL trying to call tools,
+        # synthesize a plain answer rather than returning empty content.
+        if not final_text and response.choices[0].message.tool_calls:
+            final_text = ("I tried to look up live information but the search service "
+                          "kept failing. Please try again in a moment, or rephrase your "
+                          "question so I can answer from existing knowledge.")
 
         return {
             "content": final_text,
